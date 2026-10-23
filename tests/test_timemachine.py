@@ -1,4 +1,5 @@
 import copy
+import csv
 import gzip
 import hashlib
 import io
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stdout, redirect_stderr
+from unittest.mock import patch
 
 from _load import load, FIX
 
@@ -736,6 +738,37 @@ class Cli(unittest.TestCase):
         self.assertEqual((doc["mc"]["fill"], doc["mc"]["avg_R"], doc["history"]["avg_R"]), ("next-open", 0.043, -0.076))
         with self.assertRaises(SystemExit):                 # argparse refuses an unknown fill model
             run(["run", "--plan", self.plan, "--offline", TSLA, "--fill", "vwap"])
+
+    def test_csv_export_contains_replays_and_historical_trades(self):
+        path = os.path.join(self.d, "reports", "timemachine.csv")
+        code, text, err = run(["run", "--plan", self.plan, "--offline", TSLA, "--now", NOW,
+                               "--replays", "500", "--csv", path])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Wrote %s." % path, text)
+        with open(path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        replay_rows = [row for row in rows if row["record_type"] == "monte_carlo"]
+        history_rows = [row for row in rows if row["record_type"] == "history"]
+        self.assertEqual(len(replay_rows), 500)
+        self.assertEqual(len(history_rows), 33)
+        self.assertEqual(replay_rows[0]["replay"], "1")
+        self.assertEqual(replay_rows[0]["symbol"], "TSLA")
+        self.assertEqual(replay_rows[0]["plan_date"], "2026-10-19")
+        self.assertEqual(replay_rows[0]["entry"], "364.18")
+        self.assertIn(replay_rows[0]["outcome"], ("target", "stop", "close"))
+        self.assertNotEqual(replay_rows[0]["close"], "")
+        self.assertNotEqual(replay_rows[0]["R"], "")
+        self.assertNotEqual(history_rows[0]["date"], "")
+        self.assertNotEqual(history_rows[0]["time"], "")
+        self.assertNotEqual(history_rows[0]["close"], "")
+        self.assertNotEqual(history_rows[0]["exit_price"], "")
+
+    def test_csv_and_json_exports_cannot_overwrite_each_other(self):
+        with patch.object(tm, "compute", side_effect=AssertionError("compute should not run")):
+            code, _, err = run(["run", "--plan", self.plan, "--offline", TSLA, "--now", NOW,
+                                "--csv", self.out, "--write", self.out])
+        self.assertEqual(code, 1)
+        self.assertIn("--csv and --write must use different paths", err)
 
     def test_the_plan_as_flags_matches_the_file(self):
         # the flags carry no flat_by, so the default --until is the close and the reel's numbers come out

@@ -85,6 +85,7 @@ Times are New York (ET) wall-clock; --now "2026-10-19 10:15" pins the clock.
 """
 
 import argparse
+import csv
 import datetime
 import gzip
 import json
@@ -382,7 +383,8 @@ def wilson(k, n, z=1.96):
 FILLS = ("close", "next-open")
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy", fill="close"):
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy", fill="close",
+             include_results=False):
     """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py.
     fill="close": each replay is filled at the entry (the signal bar's close).
     fill="next-open": filled at the next drawn bar's open (entry x its open ratio);
@@ -483,6 +485,8 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     }
     if next_open:
         out["median_fill"] = round(pct(sorted(fills), 0.5), 2)
+    if include_results:
+        out["replay_results"] = list(enumerate(zip(outcomes, closes, Rs), 1))
     return out
 
 
@@ -791,7 +795,8 @@ def default_until(plan, end_min, warn):
     return moved
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", fill="close"):
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", fill="close",
+                 include_replay_results=False):
     """Chart JSON text + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
@@ -849,7 +854,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                       % (len(sessions), sym, plan["date"], MIN_SESSIONS))
     pool = build_pool(sessions)
     mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"],
-                  fill)
+                  fill, include_replay_results)
     mc = dict(mc, until=clock24(until_min), until_from="flag" if until is not None else
               ("flat_by" if plan.get("flat_by") else "close"),
               pool_sessions=len(sessions), pool_from=sessions[0][0], pool_to=sessions[-1][0],
@@ -1017,6 +1022,30 @@ def _write(path, doc):
         fh.write("\n")
 
 
+def _write_csv(path, doc, replay_results):
+    fields = ("record_type", "replay", "symbol", "side", "plan_date", "date", "time", "entry", "stop", "target",
+              "outcome", "close", "exit_price", "R")
+    directory = os.path.dirname(path)
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            plan = doc["plan"]
+            for replay, (outcome, close, result) in replay_results or []:
+                exit_price = plan["target"] if outcome == "target" else plan["stop"] if outcome == "stop" else close
+                writer.writerow({"record_type": "monte_carlo", "replay": replay, "symbol": plan["symbol"],
+                                 "side": plan["side"], "plan_date": plan["date"], "entry": plan["entry"],
+                                 "stop": plan["stop"], "target": plan["target"], "outcome": outcome,
+                                 "close": close, "exit_price": exit_price, "R": result})
+            for item in doc["history"]["trades"]:
+                writer.writerow(dict(item, record_type="history", symbol=plan["symbol"], side=plan["side"],
+                                     plan_date=plan["date"]))
+    except OSError as e:
+        raise TMError("cannot write %s: %s" % (path, e))
+
+
 def compute(a):
     now = parse_now(a.now)
     plan = load_plan(a, now)
@@ -1024,13 +1053,19 @@ def compute(a):
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.fill)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.fill,
+                        bool(getattr(a, "csv", None)))
 
 
 def cmd_run(a):
+    if a.csv and a.write and os.path.normcase(os.path.abspath(a.csv)) == os.path.normcase(os.path.abspath(a.write)):
+        raise TMError("--csv and --write must use different paths")
     doc = compute(a)
+    replay_results = doc["mc"].pop("replay_results", None)
     if a.write:
         _write(a.write, doc)
+    if a.csv:
+        _write_csv(a.csv, doc, replay_results)
     if a.json:
         slim = dict(doc, mc={k: v for k, v in doc["mc"].items() if k != "sample_paths"})
         print(json.dumps(slim, indent=2))
@@ -1038,6 +1073,8 @@ def cmd_run(a):
         print("\n".join(report(doc)))
         if a.write:
             print("Wrote %s." % a.write)
+        if a.csv:
+            print("Wrote %s." % a.csv)
         print("Next: /trader-budget sizes it to your budget and your max loss per trade.")
     return 0
 
@@ -1092,6 +1129,8 @@ def main(argv=None):
     p.add_argument("--json", action="store_true")
     p.add_argument("--write", nargs="?", const="trader/timemachine.json", metavar="PATH",
                    help="save the result (default trader/timemachine.json)")
+    p.add_argument("--csv", nargs="?", const="trader/timemachine.csv", metavar="PATH",
+                   help="export every replay outcome and historical trade (default trader/timemachine.csv)")
     p = sub.add_parser("chart", help="ASCII fan chart of the replays")
     common(p)
     p.add_argument("--from", dest="from_file", nargs="?", const="trader/timemachine.json", metavar="PATH",

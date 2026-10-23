@@ -35,6 +35,7 @@ that.
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run                    # trader/plan.json, 10,000 replays, seed 19
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --write            # also save trader/timemachine.json
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --csv              # export replay outcomes and history to CSV
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --until 16:00      # end at the close instead of the plan's flat_by
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --fill next-open   # fill at the next bar's open, not the signal close
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --json
@@ -54,6 +55,7 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 | `trader/plan.json` | the plan from trader-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range, flat_by |
 | Yahoo chart API | one request: 60 days of 5-minute bars (`range=60d&interval=5m`), free and unofficial, can lag |
 | `trader/timemachine.json` | with `--write`: `{plan, mc, history}` plus the verdict, its notes and the caveats. `mc` holds the odds with their intervals, the both-touched count, percentiles, the fan-chart bands, 160 sample paths and a 24-bin histogram of the close |
+| `trader/timemachine.csv` | with `--csv`: one row per Monte Carlo replay and one per historical trade; `close` is the replay/session final candle close, while `exit_price` is the target, stop or closing price used for the outcome |
 
 ## How it works
 
