@@ -202,7 +202,8 @@ class Defaults(unittest.TestCase):
         explicit = machine(until="15:55")["mc"]
         self.assertEqual(explicit["until_from"], "flag")
         self.assertEqual(dict(m, until_from=None), dict(explicit, until_from=None))
-        self.assertEqual(self.doc["warnings"], [])
+        self.assertEqual(self.doc["warnings"], [
+            "6 bar(s) after the entry are already in the data and were not used: the odds are from the entry bar only"])
 
     def test_the_history_at_the_default(self):
         h = self.doc["history"]
@@ -236,8 +237,10 @@ class Defaults(unittest.TestCase):
     def test_a_flat_by_off_the_grid_moves_to_the_bar_before_it(self):
         doc = machine(plan(flat_by="15:47"), replays=100)
         self.assertEqual(doc["mc"]["until"], "15:45")
-        self.assertEqual(doc["warnings"], ["the plan's flat_by 15:47 is off the 5-minute grid; the replays end at "
-                                           "3:45 PM instead (pass --until to choose)"])
+        self.assertEqual(doc["warnings"], [
+            "the plan's flat_by 15:47 is off the 5-minute grid; the replays end at "
+            "3:45 PM instead (pass --until to choose)",
+            "6 bar(s) after the entry are already in the data and were not used: the odds are from the entry bar only"])
         with self.assertRaises(tm.TMError) as cm:
             machine(plan(flat_by="10:15"), replays=10)
         self.assertIn("flat_by 10:15 AM leaves nothing to replay", str(cm.exception))
@@ -261,12 +264,14 @@ class Defaults(unittest.TestCase):
 
     def test_a_bar_that_touches_both_counts_as_the_stop(self):
         # a 1.18 stop and a 1.18 target: plenty of 5-minute bars span both
-        doc = machine(plan(stop=363.0, target=365.36, stop_rule="pct", flat_by=None), replays=2000)
+        doc = machine(plan(stop=363.0, target=365.36, stop_rule="pct", flat_by=None),
+                       now=tm.parse_now("2026-10-19 10:16"), replays=2000)
         m = doc["mc"]
         self.assertEqual((m["both_touched"], m["p_both"]), (35, 0.0175))
         self.assertEqual((m["p_target"], m["p_stop"], m["p_neither"]), (0.5165, 0.4835, 0.0))
         self.assertIn("both touched in one bar: 35 (1.8 %), counted as the stop", "\n".join(tm.report(doc)))
-        sell = machine(plan(side="sell", stop=365.36, target=363.0, stop_rule="pct", flat_by=None), replays=2000)["mc"]
+        sell = machine(plan(side="sell", stop=365.36, target=363.0, stop_rule="pct", flat_by=None),
+                         now=tm.parse_now("2026-10-19 10:16"), replays=2000)["mc"]
         self.assertGreater(sell["both_touched"], 0)
         self.assertLessEqual(sell["both_touched"], round(sell["p_stop"] * 2000))
 
