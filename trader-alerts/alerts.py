@@ -546,8 +546,12 @@ def rules_from_plan(plan, cfg_flat_by=None):
         raise AlertError("the plan's flat_by %r is not a time like 15:55" % flat)
     # The plan's flat_by is already resolved for its own day (trader-exit moves it up on an
     # early close): don't shift it again here with before_close, or it rings 3 hours early.
-    out.append({"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
-                "label": "flat by close"})
+    rule = {"id": "%s-flat-by" % sym.lower(), "symbol": sym, "type": "time", "at": flat,
+                "label": "flat by close"}
+    # A generic fallback is not day-adjusted; preserve plan.flat_by because trader-exit resolves it.
+    if not plan.get("flat_by") and _hhmm(flat) > EARLY:
+        rule["before_close"] = True
+    out.append(rule)
     if plan.get("date"):
         for r in out:
             r["date"] = str(plan["date"])

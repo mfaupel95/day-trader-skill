@@ -350,6 +350,18 @@ class Rules(unittest.TestCase):
         self.assertEqual(self.at("2026-11-27 09:30", [rule2])[0], [])
         self.assertEqual(len(self.at("2026-11-27 12:30", [rule2])[0]), 1)
 
+    def test_fallback_flat_by_moves_on_early_close_only_when_after_one_pm(self):
+        plan = {"symbol": "TSLA", "stop": 358.32, "target": 370.04, "date": "2026-11-27"}
+        default_rule = alerts.rules_from_plan(plan, "15:55")[2]
+        self.assertTrue(default_rule["before_close"])
+        self.assertEqual(self.at("2026-11-27 12:54", [default_rule])[0], [])
+        rings, _ = self.at("2026-11-27 12:55", [default_rule])
+        self.assertIn("set for 12:55", rings[0]["message"])
+        early_rule = alerts.rules_from_plan(plan, "12:30")[2]
+        self.assertNotIn("before_close", early_rule)
+        rings, _ = self.at("2026-11-27 12:30", [early_rule])
+        self.assertIn("set for 12:30", rings[0]["message"])
+
     def test_a_time_alert_moves_with_an_early_close(self):
         rule = [{"id": "flat", "type": "time", "at": "15:55", "label": "flat by close", "before_close": True}]
         self.assertEqual(self.at("2026-11-27 12:54", rule)[0], [])

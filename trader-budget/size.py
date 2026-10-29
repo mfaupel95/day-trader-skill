@@ -189,7 +189,7 @@ def positive_number(key, value):
     """A limit that must be a positive number. 0, negative, missing or not a number
     is a refusal, never "no limit"."""
     f = None if isinstance(value, bool) else _f(value)
-    if f is None or f <= 0:
+    if f is None or not math.isfinite(f) or f <= 0:
         raise SizeError("%s must be a positive number, got %r" % (key, value))
     return f
 

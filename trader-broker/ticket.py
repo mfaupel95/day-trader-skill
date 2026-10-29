@@ -334,7 +334,7 @@ def _parse_utc(text):
     if not text:
         return None
     try:
-        return datetime.datetime.strptime(str(text)[:19], "%Y-%m-%dT%H:%M:%S")
+        return datetime.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         return None
 
@@ -347,7 +347,9 @@ def risk_verdict(risk, fp, today, now):
     for r in risk.get("results", []):
         if r.get("fingerprint") == fp:
             until = _parse_utc(r.get("valid_until"))
-            if until is not None and now > until:
+            if until is None:
+                return None, "the risk check has no valid expiration; run check.py again"
+            if now >= until:
                 return None, ("the risk check expired at %s New York; run check.py again"
                               % to_eastern(until).strftime("%H:%M"))
             return r, None

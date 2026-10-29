@@ -206,7 +206,7 @@ class PlanRules(unittest.TestCase):
 
     def test_a_limit_that_is_not_a_positive_number_is_refused(self):
         for key in ("max_loss_per_trade_usd", "max_position_pct", "max_order_usd", "budget"):
-            for bad in (0, -5, "fifty", True):
+            for bad in (0, -5, "fifty", True, float("nan"), float("inf"), -float("inf")):
                 with self.assertRaises(size.SizeError) as e:
                     size.size_trade(plan(), cfg(**{key: bad}), today=TODAY)
                 self.assertEqual(str(e.exception), "%s must be a positive number, got %r" % (key, bad))

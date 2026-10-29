@@ -292,12 +292,31 @@ class Flow(unittest.TestCase):
         code, text, _ = run(self.args("show", "--index", "1", now="2026-10-19 10:29"))
         self.assertEqual(code, 0)
         self.assertIn("READY: trader-risk PASS", text)
+        code, text, _ = run(self.args("show", "--index", "1", now="2026-10-19 10:30"))
+        self.assertEqual(code, 1)
+        self.assertIn("NOT READY: the risk check expired at 10:30 New York; run check.py again", text)
         code, text, _ = run(self.args("show", "--index", "1", now="2026-10-19 10:31"))
         self.assertEqual(code, 1)
         self.assertIn("NOT READY: the risk check expired at 10:30 New York; run check.py again", text)
         code, _, err = run(self.args("approve", "--index", "1", "--reply", "yes", now="2026-10-19 10:31"))
         self.assertEqual(code, 1)
         self.assertIn("expired", err)
+
+    def test_missing_or_invalid_risk_expiration_is_not_ready(self):
+        self.run_risk()
+        with open(self.risk) as fh:
+            risk = json.load(fh)
+        record = risk["results"][0]
+        for expiry in (None, "not-a-timestamp", "2026-10-19T14:30:00Zgarbage"):
+            if expiry is None:
+                record.pop("valid_until", None)
+            else:
+                record["valid_until"] = expiry
+            with open(self.risk, "w") as fh:
+                json.dump(risk, fh)
+            code, text, _ = run(self.args("show", "--index", "1"))
+            self.assertEqual(code, 1)
+            self.assertIn("NOT READY: the risk check has no valid expiration", text)
 
     def test_blocked_orders_are_never_ready(self):
         self.assertEqual(self.run_risk(now="2026-10-19 09:40"), 1)
