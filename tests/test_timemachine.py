@@ -1,4 +1,5 @@
 import copy
+import csv
 import gzip
 import hashlib
 import io
@@ -10,6 +11,7 @@ import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stdout, redirect_stderr
+from unittest.mock import patch
 
 from _load import load, FIX
 
@@ -737,6 +739,37 @@ class Cli(unittest.TestCase):
         with self.assertRaises(SystemExit):                 # argparse refuses an unknown fill model
             run(["run", "--plan", self.plan, "--offline", TSLA, "--fill", "vwap"])
 
+    def test_csv_export_contains_replays_and_historical_trades(self):
+        path = os.path.join(self.d, "reports", "timemachine.csv")
+        code, text, err = run(["run", "--plan", self.plan, "--offline", TSLA, "--now", NOW,
+                               "--replays", "500", "--csv", path])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Wrote %s." % path, text)
+        with open(path, newline="", encoding="utf-8") as fh:
+            rows = list(csv.DictReader(fh))
+        replay_rows = [row for row in rows if row["record_type"] == "monte_carlo"]
+        history_rows = [row for row in rows if row["record_type"] == "history"]
+        self.assertEqual(len(replay_rows), 500)
+        self.assertEqual(len(history_rows), 33)
+        self.assertEqual(replay_rows[0]["replay"], "1")
+        self.assertEqual(replay_rows[0]["symbol"], "TSLA")
+        self.assertEqual(replay_rows[0]["plan_date"], "2026-10-19")
+        self.assertEqual(replay_rows[0]["entry"], "364.18")
+        self.assertIn(replay_rows[0]["outcome"], ("target", "stop", "close"))
+        self.assertNotEqual(replay_rows[0]["close"], "")
+        self.assertNotEqual(replay_rows[0]["R"], "")
+        self.assertNotEqual(history_rows[0]["date"], "")
+        self.assertNotEqual(history_rows[0]["time"], "")
+        self.assertNotEqual(history_rows[0]["close"], "")
+        self.assertNotEqual(history_rows[0]["exit_price"], "")
+
+    def test_csv_and_json_exports_cannot_overwrite_each_other(self):
+        with patch.object(tm, "compute", side_effect=AssertionError("compute should not run")):
+            code, _, err = run(["run", "--plan", self.plan, "--offline", TSLA, "--now", NOW,
+                                "--csv", self.out, "--write", self.out])
+        self.assertEqual(code, 1)
+        self.assertIn("--csv and --write must use different paths", err)
+
     def test_the_plan_as_flags_matches_the_file(self):
         # the flags carry no flat_by, so the default --until is the close and the reel's numbers come out
         code, text, err = run(["run", "--symbol", "tsla", "--date", "2026-10-19", "--entry", "364.18",
@@ -812,3 +845,58 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Canada(unittest.TestCase):
+    """"market": "ca": the TSX's early closes, .TO tickers, the market from the plan."""
+
+    def tearDown(self):
+        tm.use_market("us")
+
+    def test_the_day_after_us_thanksgiving_is_a_full_tsx_day(self):
+        p = plan(date="2026-11-27")
+        with self.assertRaises(tm.TMError) as cm:                 # NYSE: a 1:00 p.m. close
+            machine(p, until="15:00")
+        self.assertIn("no later than 1:00 PM (an early close)", str(cm.exception))
+        tm.use_market("ca")
+        with self.assertRaises(tm.TMError) as cm:                 # TSX: a full day, so 15:00 is fine
+            machine(p, until="15:00")
+        self.assertIn("the entry is not in the data", str(cm.exception))
+        with self.assertRaises(tm.TMError) as cm:                 # Christmas Eve closes at 1:00 on both
+            machine(plan(date="2026-12-24"), until="15:00")
+        self.assertIn("an early close", str(cm.exception))
+
+    def test_tickers_and_the_plan_market(self):
+        self.assertEqual(tm.to_yahoo("BBD.B.TO"), "BBD-B.TO")
+        self.assertIn("/chart/RY.TO?range=60d", tm.chart_url("ry.to"))
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "plan.json")
+            with open(path, "w") as fh:
+                json.dump(dict(PLAN, symbol="RY.TO", market="ca"), fh)
+            a = type("A", (), {"symbol": None, "plan": path, "market": None})()
+            self.assertEqual(tm.load_plan(a, NOW_UTC)["symbol"], "RY.TO")
+            self.assertEqual(tm.MARKET, "ca")
+        finally:
+            shutil.rmtree(d)
+
+
+class CanadaRealData(unittest.TestCase):
+    """SHOP.TO's real 60 days of 5-minute bars: the Oct 29 2026 breakout, replayed."""
+
+    def test_shop_breakout(self):
+        tm.use_market("ca")
+        try:
+            with gzip.open(os.path.join(DIR, "SHOP.TO-60d5m.json.gz"), "rt", encoding="utf-8") as fh:
+                text = fh.read()
+            p = tm.normalize_plan({"symbol": "SHOP.TO", "side": "buy", "date": "2026-10-29", "setup": "orb",
+                                   "entry": 234.39, "stop": 230.66, "target": 238.12, "entry_time": "10:00 AM",
+                                   "opening_range": {"high": 233.7, "low": 227.63, "minutes": 15},
+                                   "stop_rule": "or_mid", "interval": "5m", "market": "ca"})
+            doc = tm.time_machine(text, p, tm.parse_now("2026-10-29 10:00"), replays=2000)
+        finally:
+            tm.use_market("us")
+        m = doc["mc"]
+        self.assertEqual((m["pool_sessions"], m["pool_from"], m["pool_to"]), (59, "2026-08-05", "2026-10-28"))
+        self.assertNotIn("2026-10-12", json.dumps(doc))                    # TSX Thanksgiving: no session
+        self.assertEqual(m["until"], "16:00")

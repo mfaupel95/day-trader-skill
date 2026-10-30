@@ -62,6 +62,49 @@ class TicketError(Exception):
     pass
 
 
+# ---------------------------------------------------------------- market and broker
+
+SIGN = "$"
+IBKR_EXCHANGE = {".TO": ("TSE", "Toronto Stock Exchange"), ".V": ("VENTURE", "TSX Venture Exchange")}
+
+
+def market_of(cfg):
+    """"us" (the default) or "ca", from "market" in trader/config.json."""
+    m = str((cfg or {}).get("market") or "us").strip().lower()
+    if m not in ("us", "ca"):
+        raise TicketError('market wants "us" or "ca", not "%s"' % m)
+    return m
+
+
+def broker_of(cfg):
+    """"broker" in the config; without one, Alpaca for "us" and Interactive Brokers for "ca"
+    (Alpaca's stock API trades US-listed shares)."""
+    b = (cfg or {}).get("broker")
+    return str(b or ("ibkr" if market_of(cfg) == "ca" else "alpaca")).lower()
+
+
+def ibkr_contract(sym):
+    """RY.TO -> ("RY", "TSE", ...): how the order reads in IBKR, for the user to check there."""
+    s = str(sym or "").upper()
+    for suf, (code, name) in IBKR_EXCHANGE.items():
+        if s.endswith(suf):
+            return s[:-len(suf)].replace("-", "."), code, name
+    return None
+
+
+class Relabel(object):
+    """For "ca": every amount this tool prints is Canadian dollars, so its "$" reads "C$"."""
+
+    def __init__(self, out):
+        self.out = out
+
+    def write(self, text):
+        return self.out.write(text.replace("$", "C$"))
+
+    def flush(self):
+        self.out.flush()
+
+
 # ---------------------------------------------------------------- time (New York, no tz files)
 
 def _nth_sunday(year, month, n):
@@ -94,14 +137,19 @@ def eastern_to_utc(local):
 
 
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """--now -> naive UTC. A bare time is New York time; an offset or Z makes it absolute."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
-    t = text.strip().replace("Z", "+00:00")
+    t = str(text).strip()
+    if t.upper().endswith(" ET"):
+        t = t[:-3].strip()
+    if re.match(r"^\d{1,2}:\d{2}$", t):
+        t = "%s %s" % (to_eastern(datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)).date().isoformat(), t.zfill(5))
+    t = t.replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise TicketError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise TicketError('--now wants a New York time like "2026-10-19 10:15" (or ...Z for UTC)')
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
@@ -195,7 +243,8 @@ def _money(v):
 
 
 def _p(v):
-    return "%.2f" % float(v)
+    v = float(v)
+    return "%.2f" % v if abs(v * 100 - round(v * 100)) < 1e-6 else "%.3f" % v   # a TSX half cent: 0.395
 
 
 def is_bracket(order):
@@ -220,7 +269,7 @@ def max_loss(order):
     if not entry:
         return None, stop
     risk = abs(entry - stop)
-    return round(q * int(round(risk * 100)) / 100.0, 2), stop
+    return round(q * int(round(risk * 1000)) / 1000.0, 2), stop   # tenths of a cent: TSX half cents
 
 
 def plain_parts(order):
@@ -384,7 +433,8 @@ def kind_of(order, rv):
 
 def render(order, idx, total, cfg, risk, state, today, now):
     ready, label, rv = status_of(order, risk, state, today, now)
-    broker = str(cfg.get("broker", "alpaca")).lower()
+    broker = broker_of(cfg)
+    ca = market_of(cfg) == "ca"
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
     lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
@@ -398,6 +448,13 @@ def render(order, idx, total, cfg, risk, state, today, now):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+        contract = ibkr_contract(order.get("symbol")) if ca else None
+        if contract:
+            lines.append("  In IBKR it is %s on %s (%s), in CAD: check that before you approve it there."
+                         % contract)
+        if ca and paper:
+            lines.append("  Paper first: the connector must be signed in to your IBKR paper account, not")
+            lines.append("  the live one. If you are not sure which it is, stop here.")
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -409,6 +466,8 @@ def render(order, idx, total, cfg, risk, state, today, now):
         lines.append("  Reply \"yes\" to place this one order, or \"no\" to skip it.")
         if broker != "ibkr":
             lines.append("  Claude's own card then asks again: Allow once places it, Deny stops it.")
+        elif ca:
+            lines.append("  Claude's own card then asks again: Allow once drafts it in IBKR, Deny stops it.")
     return "\n".join(lines), ready
 
 
@@ -417,7 +476,7 @@ def ticket_json(order, idx, cfg, risk, state, today, now):
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+            "broker": broker_of(cfg), "tool": "place_stock_order",
             "tool_input": tool_input(order), "why": order.get("why", ""),
             "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
 
@@ -547,12 +606,15 @@ def cmd_approve(a):
            "symbol": str(order.get("symbol", "")).upper(), "side": order.get("side"),
            "qty": order.get("qty"), "kind": kind_of(order, rv), "max_loss": loss, "stop": stop,
            "plain": plain(order), "status": "approved", "reply": a.reply,
-           "paper": bool(cfg.get("paper", True)), "broker": cfg.get("broker", "alpaca")}
+           "paper": bool(cfg.get("paper", True)), "broker": broker_of(cfg)}
     state.setdefault("orders", []).append(rec)
     write_json(a.state, state)
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
-    if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
+    if broker_of(cfg) == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+        if market_of(cfg) == "ca":
+            print("Claude's card shows Allow once / Deny before the draft goes to IBKR. Then: ticket.py "
+                  "result --index %d --status placed|denied|failed" % a.index)
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
@@ -743,7 +805,11 @@ def main(argv=None):
     if not a.cmd:
         ap.print_help()
         return 1
+    real_out = sys.stdout
     try:
+        cfg_path = getattr(a, "config", None) or "trader/config.json"
+        if market_of(read_json(cfg_path, "config", required=False) or {}) == "ca":
+            sys.stdout = Relabel(real_out)
         return {"show": cmd_show, "approve": cmd_approve, "decline": cmd_decline, "result": cmd_result,
                 "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
     except TicketError as e:
@@ -753,6 +819,8 @@ def main(argv=None):
         print("ticket.py: unexpected %s: %s; the input files may be malformed" % (type(e).__name__, e),
               file=sys.stderr)
         return 1
+    finally:
+        sys.stdout = real_out
 
 
 if __name__ == "__main__":

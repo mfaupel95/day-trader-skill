@@ -32,7 +32,7 @@ How the replays work (the reel's sim.py, same algorithm, same random draws):
   4. Outcomes: "target" or "stop" (whichever was touched first), or "neither"
      when the trade is still open at --until. The default --until is the
      plan's flat_by when it has one (trader-exit writes 15:55), else 16:00,
-     the close, or 13:00 on an NYSE early-close day. A flat_by after an early
+     the close, or 13:00 on an NYSE/TSX early-close day. A flat_by after an early
      close, or off the 5-minute grid, is moved to the last bar before it and
      the run says so.
      "green" = target first, or above the fill at --until (below for a sell).
@@ -85,6 +85,7 @@ Times are New York (ET) wall-clock; --now "2026-10-19 10:15" pins the clock.
 """
 
 import argparse
+import csv
 import datetime
 import gzip
 import json
@@ -122,11 +123,52 @@ NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET, from https://www.nyse.com/markets/hours-ca
     "2026-12-24": "Christmas Eve",
     "2027-11-26": "day after Thanksgiving",
 }
+# "market": "ca": the TSX's 1:00 p.m. close, from TMX's 2026 holiday list at
+# https://www.tsx.com/en/trading/calendars-and-trading-hours/calendar (read 2026-10-30), footnote
+# "Closing at 1:00 PM (TSX/TSXV)". TMX had not published 2027 yet. Holidays need no list here:
+# a closed day has no bars in the data.
+TSX_EARLY_CLOSE = {
+    "2026-12-24": "Christmas Eve",
+}
+EARLY_CLOSES = {"us": NYSE_EARLY_CLOSE, "ca": TSX_EARLY_CLOSE}
+MARKET = "us"
+CA_SUFFIXES = (".TO", ".V")  # Yahoo: Toronto Stock Exchange, TSX Venture
 EARLY_MIN = 13 * 60
 
 
 class TMError(Exception):
     pass
+
+
+def use_market(name):
+    """"us" (the default) or "ca": which exchange's early closes count."""
+    global MARKET
+    name = (name or "us").strip().lower()
+    if name not in EARLY_CLOSES:
+        raise TMError('market wants "us" or "ca", not "%s"' % name)
+    MARKET = name
+    return name
+
+
+def config_market(path, explicit=None):
+    """--market, else "market" in trader/config.json, else "us"."""
+    if explicit:
+        return explicit
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError, TypeError):
+        return "us"
+    return (doc.get("market") if isinstance(doc, dict) else None) or "us"
+
+
+def to_yahoo(sym):
+    """BRK.B -> BRK-B. A Canadian suffix stays: RY.TO -> RY.TO, BBD.B.TO -> BBD-B.TO."""
+    s = sym.upper()
+    for suf in CA_SUFFIXES:
+        if s.endswith(suf) and len(s) > len(suf):
+            return s[:-len(suf)].replace(".", "-") + suf
+    return s.replace(".", "-")
 
 
 # ---------------------------------------------------------------- time (copied from trader-alerts)
@@ -161,14 +203,19 @@ def eastern_to_utc(local):
 
 
 def parse_now(text):
-    """ISO time -> naive UTC. A time without an offset is taken as New York time."""
+    """--now -> naive UTC. A bare time is New York time; an offset or Z makes it absolute."""
     if not text:
         return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)
-    t = text.strip().replace("Z", "+00:00")
+    t = str(text).strip()
+    if t.upper().endswith(" ET"):
+        t = t[:-3].strip()
+    if re.match(r"^\d{1,2}:\d{2}$", t):
+        t = "%s %s" % (to_eastern(datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0, tzinfo=None)).date().isoformat(), t.zfill(5))
+    t = t.replace("Z", "+00:00")
     try:
         dt = datetime.datetime.fromisoformat(t)
     except ValueError:
-        raise TMError("--now wants a time like \"2026-10-19 10:15\" (New York) or ...Z (UTC)")
+        raise TMError('--now wants a New York time like "2026-10-19 10:15" (or ...Z for UTC)')
     if dt.tzinfo is None:
         return eastern_to_utc(dt)
     return (dt - dt.utcoffset()).replace(tzinfo=None)
@@ -208,7 +255,7 @@ def clock24(minutes):
 
 def chart_url(sym, host="query2"):
     return "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=60d&interval=5m" % (
-        host, urllib.parse.quote(sym.upper().replace(".", "-")))
+        host, urllib.parse.quote(to_yahoo(sym)))
 
 
 def _sleep(seconds):
@@ -382,7 +429,8 @@ def wilson(k, n, z=1.96):
 FILLS = ("close", "next-open")
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy", fill="close"):
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy", fill="close",
+             include_results=False):
     """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py.
     fill="close": each replay is filled at the entry (the signal bar's close).
     fill="next-open": filled at the next drawn bar's open (entry x its open ratio);
@@ -483,6 +531,8 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     }
     if next_open:
         out["median_fill"] = round(pct(sorted(fills), 0.5), 2)
+    if include_results:
+        out["replay_results"] = list(enumerate(zip(outcomes, closes, fills, Rs), 1))
     return out
 
 
@@ -557,10 +607,11 @@ def history_replay(sessions, rule, last, side="buy", fill="close"):
             if (b["h"] >= t) if long else (b["l"] <= t):
                 oc = "target"
                 break
-        x = t if oc == "target" else s if oc == "stop" else D[last]["c"]
+        cl = D[last]["c"]
+        x = t if oc == "target" else s if oc == "stop" else cl
         R = ((x - f) if long else (f - x)) / risk
         trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "fill": f, "stop": s,
-                       "target": t, "outcome": oc or "close", "R": round(R, 2)})
+                       "target": t, "outcome": oc or "close", "close": cl, "exit_price": x, "R": round(R, 2)})
     won = sum(1 for x in trades if x["outcome"] == "target")
     lost = sum(1 for x in trades if x["outcome"] == "stop")
     ci = wilson(won, won + lost)
@@ -595,7 +646,10 @@ def load_plan(a, now_utc):
         missing = [f for f in ("entry", "stop", "target", "entry_time") if getattr(a, f) is None]
         if missing:
             raise TMError("with --symbol also give %s" % ", ".join("--" + m.replace("_", "-") for m in missing))
-        raw = {"symbol": a.symbol, "side": a.side, "date": a.date or to_eastern(now_utc).date().isoformat(),
+        sym = a.symbol.strip().upper()
+        if MARKET == "ca" and not sym.endswith(CA_SUFFIXES):
+            sym += ".TO"                       # a bare ticker is a TSX listing
+        raw = {"symbol": sym, "side": a.side, "date": a.date or to_eastern(now_utc).date().isoformat(),
                "entry": a.entry, "stop": a.stop, "target": a.target, "entry_time": a.entry_time,
                "setup": a.setup, "opening_range": {"minutes": a.or_minutes}, "stop_rule": a.stop_rule,
                "interval": "5m"}
@@ -611,6 +665,8 @@ def load_plan(a, now_utc):
             raise TMError("%s is not valid JSON: %s" % (a.plan, e))
         if not isinstance(raw, dict):
             raise TMError("%s is not a plan" % a.plan)
+        if raw.get("market") and not getattr(a, "market", None):
+            use_market(raw["market"])          # trader-exit writes "market": "ca" on a Canadian plan
         src = a.plan
     return normalize_plan(raw, src)
 
@@ -791,7 +847,8 @@ def default_until(plan, end_min, warn):
     return moved
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", fill="close"):
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", fill="close",
+                 include_replay_results=False):
     """Chart JSON text + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
@@ -803,7 +860,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
     msym = str(meta.get("symbol") or "").upper()
-    if msym and msym != sym.replace(".", "-"):
+    if msym and msym != to_yahoo(sym):
         raise TMError("the data is for %s but the plan is for %s" % (msym, sym))
     gran = meta.get("dataGranularity")
     if gran and gran != "5m":
@@ -811,7 +868,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     if not bars:
         raise TMError("no complete 5-minute bars for %s in the data" % sym)
     k = plan["entry_bar"]
-    early = plan["date"] in NYSE_EARLY_CLOSE
+    early = plan["date"] in EARLY_CLOSES[MARKET]
     end_min = EARLY_MIN if early else CLOSE_MIN
     warn = []
     until_min = default_until(plan, end_min, warn) if until is None else parse_clock(until, "--until")
@@ -849,7 +906,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
                       % (len(sessions), sym, plan["date"], MIN_SESSIONS))
     pool = build_pool(sessions)
     mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"],
-                  fill)
+                  fill, include_replay_results)
     mc = dict(mc, until=clock24(until_min), until_from="flag" if until is not None else
               ("flat_by" if plan.get("flat_by") else "close"),
               pool_sessions=len(sessions), pool_from=sessions[0][0], pool_to=sessions[-1][0],
@@ -1017,6 +1074,30 @@ def _write(path, doc):
         fh.write("\n")
 
 
+def _write_csv(path, doc, replay_results):
+    fields = ("record_type", "replay", "symbol", "side", "plan_date", "date", "time", "entry", "fill", "stop",
+              "target", "outcome", "close", "exit_price", "R")
+    directory = os.path.dirname(path)
+    try:
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            plan = doc["plan"]
+            for replay, (outcome, close, fill, result) in replay_results or []:
+                exit_price = plan["target"] if outcome == "target" else plan["stop"] if outcome == "stop" else close
+                writer.writerow({"record_type": "monte_carlo", "replay": replay, "symbol": plan["symbol"],
+                                 "side": plan["side"], "plan_date": plan["date"], "entry": plan["entry"], "fill": fill,
+                                 "stop": plan["stop"], "target": plan["target"], "outcome": outcome,
+                                 "close": close, "exit_price": exit_price, "R": result})
+            for item in doc["history"]["trades"]:
+                writer.writerow(dict(item, record_type="history", symbol=plan["symbol"], side=plan["side"],
+                                     plan_date=plan["date"]))
+    except OSError as e:
+        raise TMError("cannot write %s: %s" % (path, e))
+
+
 def compute(a):
     now = parse_now(a.now)
     plan = load_plan(a, now)
@@ -1024,13 +1105,19 @@ def compute(a):
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.fill)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, a.fill,
+                        bool(getattr(a, "csv", None)))
 
 
 def cmd_run(a):
+    if a.csv and a.write and os.path.normcase(os.path.abspath(a.csv)) == os.path.normcase(os.path.abspath(a.write)):
+        raise TMError("--csv and --write must use different paths")
     doc = compute(a)
+    replay_results = doc["mc"].pop("replay_results", None)
     if a.write:
         _write(a.write, doc)
+    if a.csv:
+        _write_csv(a.csv, doc, replay_results)
     if a.json:
         slim = dict(doc, mc={k: v for k, v in doc["mc"].items() if k != "sample_paths"})
         print(json.dumps(slim, indent=2))
@@ -1038,6 +1125,8 @@ def cmd_run(a):
         print("\n".join(report(doc)))
         if a.write:
             print("Wrote %s." % a.write)
+        if a.csv:
+            print("Wrote %s." % a.csv)
         print("Next: /trader-budget sizes it to your budget and your max loss per trade.")
     return 0
 
@@ -1086,12 +1175,17 @@ def main(argv=None):
                        help="fill at the signal bar's close (default) or at the next bar's open")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
+        p.add_argument("--config", default="trader/config.json")
+        p.add_argument("--market", choices=sorted(EARLY_CLOSES), help='"us" or "ca" (default: the plan\'s, '
+                       'the config\'s, else us)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)
     p.add_argument("--json", action="store_true")
     p.add_argument("--write", nargs="?", const="trader/timemachine.json", metavar="PATH",
                    help="save the result (default trader/timemachine.json)")
+    p.add_argument("--csv", nargs="?", const="trader/timemachine.csv", metavar="PATH",
+                   help="export every replay outcome and historical trade (default trader/timemachine.csv)")
     p = sub.add_parser("chart", help="ASCII fan chart of the replays")
     common(p)
     p.add_argument("--from", dest="from_file", nargs="?", const="trader/timemachine.json", metavar="PATH",
@@ -1101,6 +1195,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
+        use_market(config_market(a.config, a.market))
         return {"run": cmd_run, "chart": cmd_chart}[a.cmd](a)
     except TMError as e:
         print("timemachine.py: %s" % e, file=sys.stderr)

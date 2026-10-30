@@ -1,0 +1,5 @@
+
+__pycache__/
+*.py[cod]
+trader/watchlist.json
+__pycache__/
