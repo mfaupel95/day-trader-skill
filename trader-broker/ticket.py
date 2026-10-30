@@ -8,11 +8,14 @@ work around the one moment that matters, your yes:
             exact JSON Claude will send to Alpaca's place_stock_order tool.
             A bracket order shows its stop-loss, take-profit and the max loss
             at the stop. An order is READY only if trader-risk passed THIS
-            exact order today (matched by fingerprint) and nobody has decided
-            on it yet.
+            exact order today (matched by fingerprint), that verdict has not
+            expired (check.py's valid_until: 15 minutes, and for an entry no
+            later than its no_entries_after cutoff or the close), and nobody
+            has decided on it yet.
   approve   records your explicit yes for ONE order, with your reply word for
-            word. It refuses "yes to all", "sure", "ok", a yes that names a
-            different stock or amount, and any order that is not READY.
+            word. It refuses "yes to all", "sure", "ok", a yes that names
+            another order in the batch or a different amount, and any order
+            that is not READY.
   decline   records a no.
   result    records what happened after the Allow once / Deny card:
             placed (with the broker's order id), denied, or failed.
@@ -143,8 +146,17 @@ def rec_day(rec):
 # ---------------------------------------------------------------- the order
 
 def fingerprint(order):
-    """Same function as trader-risk/check.py: identifies the exact order."""
+    """The exact order: its Alpaca fields plus the plan's entry, stop and target, so an
+    edited plan invalidates a verdict. Byte-identical in trader-risk/check.py and
+    trader-broker/ticket.py. Numbers go through float(), so "358.32" and 358.32 agree."""
     core = {k: order[k] for k in ALPACA_FIELDS if k in order and order[k] is not None}
+    plan = order.get("plan") if isinstance(order.get("plan"), dict) else {}
+    for k in ("entry", "stop", "target"):
+        if plan.get(k) is not None:
+            try:
+                core["plan." + k] = float(plan[k])
+            except (TypeError, ValueError):
+                core["plan." + k] = str(plan[k])
     blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -269,7 +281,12 @@ def amount_numbers(order):
 
 
 def parse_yes(reply, order, batch_symbols=()):
-    """Is this reply an explicit yes for THIS one order? Returns (ok, why)."""
+    """Is this reply an explicit yes for THIS one order? Returns (ok, why).
+
+    Refused: an empty reply or a question, anything that does not start with yes,
+    a batch word (all, both, the rest), a doubt (but, wait, if), a yes that names
+    ANOTHER ORDER IN THE BATCH by its symbol (a ticker that is not in the batch
+    is not checked), and a number that is not one of this order's amounts."""
     raw = (reply or "").strip()
     if not raw:
         return False, "the reply is empty"
@@ -312,21 +329,37 @@ def latest(state, fp, today):
     return found
 
 
-def risk_verdict(risk, fp, today):
+def _parse_utc(text):
+    """"2026-10-19T14:30:00Z" -> naive UTC, same stamp format check.py writes."""
+    if not text:
+        return None
+    try:
+        return datetime.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+
+
+def risk_verdict(risk, fp, today, now):
     if not risk:
         return None, "trader-risk has not checked these orders (run check.py)"
     if risk.get("date") != today:
         return None, "the risk check is from %s, not today; run check.py again" % risk.get("date")
     for r in risk.get("results", []):
         if r.get("fingerprint") == fp:
+            until = _parse_utc(r.get("valid_until"))
+            if until is None:
+                return None, "the risk check has no valid expiration; run check.py again"
+            if now >= until:
+                return None, ("the risk check expired at %s New York; run check.py again"
+                              % to_eastern(until).strftime("%H:%M"))
             return r, None
     return None, "this exact order was not in the last risk check (it changed or is new); run check.py again"
 
 
-def status_of(order, risk, state, today):
+def status_of(order, risk, state, today, now):
     """(ready, label, risk_result)"""
     fp = fingerprint(order)
-    rv, why = risk_verdict(risk, fp, today)
+    rv, why = risk_verdict(risk, fp, today, now)
     if rv is None:
         return False, "NOT READY: " + why, None
     if rv.get("verdict") != "PASS":
@@ -349,8 +382,8 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+def render(order, idx, total, cfg, risk, state, today, now):
+    ready, label, rv = status_of(order, risk, state, today, now)
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
@@ -379,8 +412,8 @@ def render(order, idx, total, cfg, risk, state, today):
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+def ticket_json(order, idx, cfg, risk, state, today, now):
+    ready, label, rv = status_of(order, risk, state, today, now)
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
@@ -464,6 +497,8 @@ def _load(a):
     orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
     if not isinstance(orders, list) or not orders:
         raise TicketError("no orders in %s" % a.orders)
+    if not all(isinstance(o, dict) for o in orders):
+        raise TicketError("every order in %s must be a JSON object" % a.orders)
     cfg = read_json(a.config, "config", required=False) or {}
     risk = read_json(a.risk, "risk check", required=False)
     state = load_state(a.state)
@@ -483,12 +518,12 @@ def cmd_show(a):
     orders, cfg, risk, state, today, now = _load(a)
     picks = [(a.index, _pick(orders, a.index))] if a.index else list(enumerate(orders, 1))
     if a.json:
-        out = [ticket_json(o, i, cfg, risk, state, today) for i, o in picks]
+        out = [ticket_json(o, i, cfg, risk, state, today, now) for i, o in picks]
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
     for i, o in picks:
-        text, ready = render(o, i, len(orders), cfg, risk, state, today)
+        text, ready = render(o, i, len(orders), cfg, risk, state, today, now)
         blocks.append(text)
         any_ready = any_ready or ready
     print("\n\n".join(blocks))
@@ -500,7 +535,7 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now = _load(a)
     order = _pick(orders, a.index)
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, now)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
@@ -713,6 +748,10 @@ def main(argv=None):
                 "fill": cmd_fill, "flatten": cmd_flatten, "log": cmd_log}[a.cmd](a)
     except TicketError as e:
         print("ticket.py: %s" % e, file=sys.stderr)
+        return 1
+    except (ValueError, TypeError, KeyError, OSError, ZeroDivisionError) as e:
+        print("ticket.py: unexpected %s: %s; the input files may be malformed" % (type(e).__name__, e),
+              file=sys.stderr)
         return 1
 
 

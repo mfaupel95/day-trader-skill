@@ -107,6 +107,50 @@ class Quotes(unittest.TestCase):
             with self.assertRaises(alerts.AlertError):
                 alerts.parse_stooq(fh.read(), "ZZZZ")
 
+    def test_junk_in_a_quote_is_one_error_not_a_traceback(self):
+        with open(os.path.join(QDIR, "yahoo-TSLA.json")) as fh:
+            doc = json.load(fh)
+
+        def with_meta(**kw):
+            d = json.loads(json.dumps(doc))
+            d["chart"]["result"][0]["meta"].update(kw)
+            return json.dumps(d)
+        for bad in ("abc", "NaN", float("nan"), float("inf"), True, [366.0], {"raw": 366.0}):
+            with self.assertRaises(alerts.AlertError) as cm:
+                alerts.parse_yahoo(with_meta(regularMarketPrice=bad), "TSLA")
+            self.assertIn("not a number", str(cm.exception))
+            self.assertNotIn("\n", str(cm.exception))
+        # the other fields degrade to None / "" instead of blowing up
+        q = alerts.parse_yahoo(with_meta(previousClose="n/a", regularMarketTime="soon", chartPreviousClose=None),
+                               "TSLA")
+        self.assertEqual((q["price"], q["prev_close"], q["time"]), (366.475, None, ""))
+        q = alerts.parse_yahoo(with_meta(previousClose=float("nan"), regularMarketTime=-1e30), "TSLA")
+        self.assertEqual((q["prev_close"], q["time"]), (354.72, ""))   # chartPreviousClose steps in
+        q = alerts.parse_yahoo(with_meta(previousClose=float("nan"), chartPreviousClose="?"), "TSLA")
+        self.assertIsNone(q["prev_close"])
+        d = json.loads(json.dumps(doc))
+        d["chart"]["result"][0]["indicators"]["quote"][0]["open"] = ["x", None, 357.5]
+        self.assertEqual(alerts.parse_yahoo(json.dumps(d), "TSLA")["open"], 357.5)
+        # a quote with a junk price is dropped from the batch with its one line
+        bad_dir = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(bad_dir, "yahoo-TSLA.json"), "w") as fh:
+                fh.write(with_meta(regularMarketPrice="NaN"))
+            shutil.copy(os.path.join(QDIR, "yahoo-KO.json"), bad_dir)
+            quotes, errors = alerts.get_quotes(["TSLA", "KO"], "yahoo", bad_dir)
+            self.assertEqual(sorted(quotes), ["KO"])
+            self.assertEqual(len(errors), 1)
+            self.assertIn("TSLA is not a number", errors[0])
+        finally:
+            shutil.rmtree(bad_dir)
+        # stooq: a close that is not a number
+        with self.assertRaises(alerts.AlertError):
+            alerts.parse_stooq("Symbol,Date,Time,Open,High,Low,Close,Volume\nAAPL,2026-10-13,22:00,1,2,3,nan,4",
+                               "AAPL")
+        q = alerts.parse_stooq("Symbol,Date,Time,Open,High,Low,Close,Volume\nAAPL,2026-10-13,22:00,x,2,3,341.27,4",
+                               "AAPL")
+        self.assertEqual((q["price"], q["open"]), (341.27, None))
+
     def test_urls_and_user_agent(self):
         self.assertEqual(alerts.UA, UA)
         self.assertEqual(alerts.stooq_url("BRK.B"), "https://stooq.com/q/l/?s=brk-b.us&f=sd2t2ohlcv&h&e=csv")
@@ -266,7 +310,8 @@ class Rules(unittest.TestCase):
         self.assertEqual([(r["id"], r["type"]) for r in rules],
                          [("tsla-plan-stop", "stop"), ("tsla-plan-target", "target"), ("tsla-flat-by", "time")])
         self.assertEqual((rules[0]["price"], rules[1]["price"]), (358.32, 370.04))
-        self.assertEqual((rules[2]["at"], rules[2]["label"], rules[2]["before_close"]), ("15:55", "flat by close", True))
+        self.assertEqual((rules[2]["at"], rules[2]["label"]), ("15:55", "flat by close"))
+        self.assertNotIn("before_close", rules[2])  # the plan's flat_by is already resolved for its day
         self.assertTrue(all(r["date"] == "2026-10-19" for r in rules))
         rings, st = self.at("2026-10-19 10:52", rules)          # the real 10:52 quote, 366.475
         self.assertEqual(rings, [])
@@ -290,6 +335,32 @@ class Rules(unittest.TestCase):
         rings, _ = self.at("2026-10-19 16:10", rules)
         self.assertIn("the market has closed", rings[0]["message"])
         self.assertEqual(self.at("2026-10-20 15:56", rules, st)[0], [])     # plan rules: their day only
+
+    def test_plan_flat_by_rings_at_the_plans_own_time_on_an_early_close(self):
+        # trader-exit already moves flat_by up for a 1 PM early close (15:55 -> 12:55); the
+        # plan rule must ring exactly then, not 3 hours earlier again.
+        plan = dict(symbol="TSLA", stop=358.32, target=370.04, flat_by="12:55", date="2026-11-27")
+        rule = alerts.rules_from_plan(plan)[2]
+        self.assertEqual(self.at("2026-11-27 12:54", [rule])[0], [])
+        rings, _ = self.at("2026-11-27 12:55", [rule])
+        self.assertIn("set for 12:55", rings[0]["message"])
+        # an explicit --flat-by 12:30 (left alone by trader-exit since it is before the 1 PM close)
+        plan2 = dict(plan, flat_by="12:30")
+        rule2 = alerts.rules_from_plan(plan2)[2]
+        self.assertEqual(self.at("2026-11-27 09:30", [rule2])[0], [])
+        self.assertEqual(len(self.at("2026-11-27 12:30", [rule2])[0]), 1)
+
+    def test_fallback_flat_by_moves_on_early_close_only_when_after_one_pm(self):
+        plan = {"symbol": "TSLA", "stop": 358.32, "target": 370.04, "date": "2026-11-27"}
+        default_rule = alerts.rules_from_plan(plan, "15:55")[2]
+        self.assertTrue(default_rule["before_close"])
+        self.assertEqual(self.at("2026-11-27 12:54", [default_rule])[0], [])
+        rings, _ = self.at("2026-11-27 12:55", [default_rule])
+        self.assertIn("set for 12:55", rings[0]["message"])
+        early_rule = alerts.rules_from_plan(plan, "12:30")[2]
+        self.assertNotIn("before_close", early_rule)
+        rings, _ = self.at("2026-11-27 12:30", [early_rule])
+        self.assertIn("set for 12:30", rings[0]["message"])
 
     def test_a_time_alert_moves_with_an_early_close(self):
         rule = [{"id": "flat", "type": "time", "at": "15:55", "label": "flat by close", "before_close": True}]
@@ -443,6 +514,56 @@ class Cli(unittest.TestCase):
         code, text, _ = run(["clock", "--now", "2026-12-25T10:00"])
         self.assertEqual(code, 1)
         self.assertIn("Christmas Day", text)
+
+    def test_check_says_when_the_year_is_off_the_calendar(self):
+        run(["add", "--rules", self.rules, "--opening-bell"])
+        code, text, _ = self.check("2028-03-01 10:00")
+        self.assertIn("Holiday list covers 2026 and 2027 only: check nyse.com for this date.", text)
+        code, text, _ = self.check("2026-10-19 10:00")
+        self.assertNotIn("Holiday list", text)
+
+    def test_a_re_added_rule_starts_armed(self):
+        args = ["add", "--rules", self.rules, "--state", self.state, "--symbol", "AAPL", "--above", "340"]
+        self.assertEqual(run(args)[0], 0)
+        code, text, _ = self.check("2026-10-13T20:00")
+        self.assertEqual(code, 0)                                      # AAPL 341.27 is above 340
+        with open(self.state) as fh:
+            self.assertIn("aapl-above-340", json.load(fh)["rung"])
+        self.assertEqual(self.check("2026-10-13T20:01")[0], 1)         # rang once
+        with open(self.rules, "w") as fh:                              # the user deletes the rule by hand...
+            json.dump({"rules": []}, fh)
+        self.assertEqual(run(args)[0], 0)                              # ...and adds it back
+        with open(self.state) as fh:
+            self.assertNotIn("aapl-above-340", json.load(fh)["rung"])
+        self.assertEqual(self.check("2026-10-13T20:02")[0], 0)         # it rings again
+
+    def test_a_write_that_fails_is_one_line(self):
+        run(["add", "--rules", self.rules, "--symbol", "AAPL", "--above", "340"])
+        os.makedirs(self.prices)                                       # a folder where prices.json should be
+        code, _, err = self.check("2026-10-13T20:00")
+        self.assertEqual(code, 1)
+        self.assertIn("alerts.py: could not write", err)
+        self.assertNotIn("Traceback", err)
+        self.assertTrue(os.path.exists(self.state))                    # the state was written before it
+        os.makedirs(self.state + ".d")
+        code, _, err = run(["check", "--rules", self.rules, "--state", self.state + ".d", "--offline", QDIR,
+                            "--now", "2026-10-13T20:00"])
+        self.assertEqual(code, 1)
+        self.assertIn("alerts.py: could not", err)                     # a folder as the state file
+        self.assertNotIn("Traceback", err)
+
+    def test_an_unexpected_error_is_one_line(self):
+        old = alerts.cmd_clock
+
+        def boom(a):
+            raise KeyError("opens")
+        alerts.cmd_clock = boom
+        try:
+            code, _, err = run(["clock"])
+        finally:
+            alerts.cmd_clock = old
+        self.assertEqual(code, 1)
+        self.assertIn("alerts.py: unexpected KeyError", err)
 
     def test_check_without_rules(self):
         code, _, err = run(["check", "--rules", self.rules, "--offline", QDIR])

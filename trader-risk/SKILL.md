@@ -43,9 +43,8 @@ python3 "${CLAUDE_SKILL_DIR}/check.py" --now "2026-10-19 10:15"  # pin the clock
 | `trader/config.json` | the limits (trader-budget ships `config.example.json`) |
 | `trader/portfolio.json` | cash and holdings; if missing, a fresh account funded with the budget |
 | `trader/prices.json` | a fresh price raises the entry it measures risk from; also values holdings |
-| `trader/state/broker.json` | what was placed today: duplicates, trades per day, daily loss, day trades |
-| `trader/state/risk.json` | the verdicts it writes, with a fingerprint of each exact order |
-
+| `trader/state/broker.json` | placed orders and unresolved approvals from today; an approval with no result counts as placed for duplicate, trades/day, daily limits and daily loss |
+| `trader/state/risk.json` | verdicts with a fingerprint of each exact order (Alpaca fields plus plan entry/stop/target) and a `valid_until` for each order |
 ## Entries and exits
 
 An **entry** opens or adds to a position: a buy, or a sell that would go
@@ -77,20 +76,32 @@ batch that is fine order by order but breaks a limit together is caught.
 | pdt | (entries, only with `pdt_guard` true) 3 day trades already in the last 5 business days |
 | duplicate | (entries) the same symbol and side twice in one batch, or already placed today |
 | daily limit | (entries) `max_orders_per_day` orders already placed today |
+| unresolved approval | not a check of its own: an approval in `trader/state/broker.json` from today with no placed, denied or failed record after it (`ticket.py result` was never run) counts as placed for duplicate, trades, daily limit and daily loss, with its max loss, and gets a warning |
 
 How the numbers work:
 
 - **The entry it measures from**: the limit price for a limit order. For a
   market order, the HIGHER of the plan's entry and a fresh price from
   `trader/prices.json` (under 15 minutes old). A plan written at 10:15 cannot
-  understate the risk at 10:55 after the price ran up. An older price is not
-  used, and it says so.
+  understate the risk at 10:55 after the price ran up. An older (or
+  future-stamped: check the clock or time zone) price is not used, and it
+  says so; with no plan at all, a market entry with no fresh price is BLOCKed
+  outright rather than sized from a stale one.
+- **A verdict expires**: `valid_until` is the earlier of 15 minutes from the
+  check and, for an entry, the (early-close-adjusted) `no_entries_after`
+  cutoff or the close. trader-broker refuses an expired PASS and asks for
+  check.py again; an exit only ever needs the 15 minutes.
 - **Daily loss** counts the full max loss of every entry placed today, win or
   lose, as trader-broker logged it. Three full-size trades use up a $150 day.
+- **Unresolved approvals** count as placed. The limits only hold if every
+  order placed is in the log, and the log is written by hand (`ticket.py
+  result`). An approval with no result is the gap: the order may be at the
+  broker. It counts until a result is recorded, and the warning says which one.
 - **The window** is New York time, worked out in the tool (daylight saving
-  included), never from the computer's clock zone. Weekends and NYSE holidays
-  are closed. On a 1:00 p.m. early close the window ends 3 hours earlier too.
-  Set both `no_entries_*` to null to switch the window off.
+  included), never from the computer's clock zone. Weekends, NYSE holidays and
+  outside the regular session always block an entry, even with both
+  `no_entries_*` set to null. On a 1:00 p.m. early close, a `no_entries_after`
+  past the early close moves up with it; one already before it stays.
 - **pdt_guard** (off by default) counts a day trade as a symbol bought and
   sold on the same day in the log, plus any entry placed today (it is meant
   to be flat by the close). FINRA removed the $25,000 pattern-day-trader
@@ -100,22 +111,32 @@ How the numbers work:
 
 Warnings do not block, but say them to the user: a LIVE account, a number
 sent as a number instead of a string, a stop that lives only in the plan and
-not at the broker, a price too old to use, an early close today.
+not at the broker, a price too old to use, an early close today, an approval
+with no result recorded.
 
 ## Steps
 
-1. If the price may have moved since the plan, refresh it first
+1. Reconcile first. The log is only as good as what was written to it, so
+   before the check, ask the broker what it has (read-only tools):
+   `get_orders` for today, all statuses, and `get_all_positions`. Compare
+   with `trader/state/broker.json` and `trader/portfolio.json`. An order at
+   the broker with no placed record: `ticket.py result --index N --status
+   placed --broker-id ID`. A position with no fill: `ticket.py fill`. An
+   approval the broker never got: `--status denied` or `failed`. Only then
+   is the check counting from the truth.
+2. If the price may have moved since the plan, refresh it first
    (trader-alerts: `alerts.py quote TSLA --write`).
-2. Run `check.py`. Exit code 0 means every order passed, 1 means at least one
+3. Run `check.py`. Exit code 0 means every order passed, 1 means at least one
    was blocked.
-3. Tell the user the result in plain words, order by order: the max loss at
+4. Tell the user the result in plain words, order by order: the max loss at
    the stop, reward:risk, and how much of today's limits it uses. For a
    BLOCK, give the reason and the fix (fewer shares, a closer stop from
    trader-exit, wait for the window, or skip the trade). Never change a
    limit yourself.
-4. If the order changes in any way, run the check again. trader-broker matches
-   each order to its verdict by fingerprint, so an edited order is not ready
-   until it passes again, and a verdict from yesterday does not count today.
+5. If the order changes in any way, including its plan's entry, stop or
+   target, run the check again. trader-broker matches each order to its
+   verdict by fingerprint, so an edited order is not ready until it passes
+   again, and a verdict from yesterday does not count today.
 
 ## Example: the reel
 

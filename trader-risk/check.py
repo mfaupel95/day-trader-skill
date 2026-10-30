@@ -54,9 +54,15 @@ What blocks an entry (on top):
   pdt           only with "pdt_guard": true: 3 day trades already in the last
                 5 business days (a 4th would trip the old pattern-day-trader rule)
 
+An approval in trader/state/broker.json from today with no placed, denied or
+failed record after it (ticket.py result was never run) counts as placed for
+the duplicate, trades, daily limit and daily loss checks, and is warned about:
+the order may be sitting at the broker.
+
 Exit code 0 when every order passes, 1 when any order is blocked.
-The verdicts go to trader/state/risk.json with a fingerprint of each order,
-so trader-broker only shows an order as ready if THIS exact order passed today.
+The verdicts go to trader/state/risk.json with a fingerprint of each order
+(its Alpaca fields plus the plan's entry, stop and target), so trader-broker
+only shows an order as ready if THIS exact order passed today.
 """
 
 import argparse
@@ -89,7 +95,7 @@ HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 CENT = 0.005
 FRESH_MINUTES = 15
 REF_WORDS = {"plan": "the plan's entry", "price": "the latest price", "limit": "the limit price",
-             "stop price": "the stop price", "stale price": "an old price"}
+             "stop price": "the stop price"}
 
 NYSE_HOLIDAYS = {
     "2026-01-01": "New Year's Day",
@@ -205,17 +211,23 @@ def hhmm(value, key):
     return datetime.time(int(m.group(1)), int(m.group(2)))
 
 
-def _shift(t, hours):
-    dt = datetime.datetime.combine(datetime.date(2000, 1, 1), t) - datetime.timedelta(hours=hours)
-    return dt.time()
+def early_cutoff(day, t, close):
+    """Same rule as trader-entry/entry.py's early_cutoff: a cutoff after the early close
+    moves up with it (15:30 -> 12:30 before a 1:00 p.m. close); one already before the
+    early close stays as is."""
+    at = datetime.datetime.combine(day, t)
+    close_dt = datetime.datetime.combine(day, close)
+    if at < close_dt:
+        return t
+    moved = at - (datetime.datetime.combine(day, CLOSE) - close_dt)
+    return moved.time() if moved.time() > OPEN else close
 
 
 def window_check(now_et, c):
-    """Reasons an entry cannot be placed now (New York time). Empty when the window is off."""
+    """Reasons an entry cannot be placed now (New York time): closed market or outside the
+    regular session always apply; no_entries_before/after only when configured."""
     before = hhmm(c.get("no_entries_before"), "no_entries_before")
     after = hhmm(c.get("no_entries_after"), "no_entries_after")
-    if before is None and after is None:
-        return [], []
     warns = []
     d, t = now_et.date(), now_et.time().replace(second=0, microsecond=0)
     if d.year not in CALENDAR_YEARS:
@@ -230,9 +242,11 @@ def window_check(now_et, c):
         return ["window: the market is closed (%s New York; the session is %s to %s)"
                 % (stamp, OPEN.strftime("%H:%M"), close.strftime("%H:%M"))], warns
     if close == EARLY and after is not None:
-        after = _shift(after, 3)
-        warns.append("early close at 1:00 p.m. today (%s): no new entries after %s"
-                     % (NYSE_EARLY_CLOSE[d.isoformat()], after.strftime("%H:%M")))
+        adjusted = early_cutoff(d, after, close)
+        if adjusted != after:
+            warns.append("early close at 1:00 p.m. today (%s): no new entries after %s"
+                         % (NYSE_EARLY_CLOSE[d.isoformat()], adjusted.strftime("%H:%M")))
+        after = adjusted
     if before is not None and t < before:
         return ["window: no new entries before %s New York (it is %s)" % (before.strftime("%H:%M"),
                                                                           t.strftime("%H:%M"))], warns
@@ -269,8 +283,17 @@ def read_json(path, what, required=True):
 
 
 def fingerprint(order):
-    """Same function in trader-broker/ticket.py: the exact order that was checked."""
+    """The exact order: its Alpaca fields plus the plan's entry, stop and target, so an
+    edited plan invalidates a verdict. Byte-identical in trader-risk/check.py and
+    trader-broker/ticket.py. Numbers go through float(), so "358.32" and 358.32 agree."""
     core = {k: order[k] for k in ALPACA_FIELDS if k in order and order[k] is not None}
+    plan = order.get("plan") if isinstance(order.get("plan"), dict) else {}
+    for k in ("entry", "stop", "target"):
+        if plan.get(k) is not None:
+            try:
+                core["plan." + k] = float(plan[k])
+            except (TypeError, ValueError):
+                core["plan." + k] = str(plan[k])
     blob = json.dumps(core, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
@@ -293,6 +316,16 @@ def _cent(x):
 
 def _p(x):
     return "%.2f" % float(x)
+
+
+def _age_words(age):
+    """A price's age vs "fresh" (see fresh()): too old, or stamped ahead of now_utc, which
+    almost always means the wrong --now or a time-zone mismatch, not a time machine."""
+    if age is None:
+        return "has no timestamp"
+    if age < -60:
+        return "is stamped %.0f minutes in the future (check the clock or time zone)" % (-age / 60.0)
+    return "is older than %d minutes" % FRESH_MINUTES
 
 
 def account(cfg, portfolio, prices):
@@ -347,6 +380,23 @@ def placed_today(state, today):
     return out
 
 
+def unresolved_approvals(state, today):
+    """Approvals recorded today with no later placed, denied or failed record for the
+    same fingerprint: the order may be at the broker with ticket.py result never run.
+    They count as placed until a result is recorded."""
+    recs = (state or {}).get("orders", [])
+    out = []
+    for i, rec in enumerate(recs):
+        if rec.get("status") != "approved" or rec_day(rec) != today:
+            continue
+        fp = rec.get("fingerprint")
+        if any(r.get("fingerprint") == fp and rec_day(r) == today
+               and r.get("status") in ("placed", "denied", "failed") for r in recs[i + 1:]):
+            continue
+        out.append(rec)
+    return out
+
+
 def day_trades(state, today):
     """Day trades in the last 5 business days: a (day, symbol) with both a buy
     and a sell placed or filled that day. An entry placed today counts too: it
@@ -383,7 +433,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     today = today or now_et.date().isoformat()
     acct, top_warn = account(c, portfolio, prices)
     blocked = {str(b).upper() for b in c.get("blocked") or []}
-    done_today = placed_today(state, today)
+    pending = unresolved_approvals(state, today)
+    for r in pending:
+        top_warn.append("an approval for %s at %s has no result recorded: run ticket.py result, or check "
+                        "get_orders at the broker" % (r.get("plain") or "%s %s" % (r.get("side"), r.get("symbol")),
+                                                      r.get("at")))
+    done_today = placed_today(state, today) + pending
     count_today = len(done_today)
     entries_today = [r for r in done_today if rec_is_entry(r)]
     loss_today = 0.0
@@ -403,6 +458,18 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
     if not c.get("paper", True):
         top_warn.append("LIVE account (\"paper\": false): these orders use real money")
     top_warn.extend(win_warns)
+
+    # How long each verdict stays good for trader-broker: 15 minutes everywhere, and for an
+    # entry also no later than the (early-close-adjusted) no_entries_after cutoff or the close.
+    fresh_until = now_utc + datetime.timedelta(minutes=FRESH_MINUTES)
+    d = now_et.date()
+    day_close = EARLY if d.isoformat() in NYSE_EARLY_CLOSE else CLOSE
+    entry_until = eastern_to_utc(datetime.datetime.combine(d, day_close))
+    after_t = hhmm(c.get("no_entries_after"), "no_entries_after")
+    if after_t is not None:
+        cutoff_utc = eastern_to_utc(datetime.datetime.combine(d, early_cutoff(d, after_t, day_close)))
+        entry_until = min(entry_until, cutoff_utc)
+    entry_until = min(entry_until, fresh_until)
 
     def fresh(sym):
         if sym not in prices:
@@ -499,11 +566,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 if live and ref_from == "price" and plan_entry and live > plan_entry + CENT:
                     info.append("%s last %s is above the plan's entry %s: the risk is measured from %s"
                                 % (sym, _p(ref), _p(plan_entry), _p(ref)))
-            elif sym in prices:
-                ref, ref_from = prices[sym], "stale price"
+        price_age = None
+        if live is None and sym in prices and price_times is not None:
+            t = price_times.get(sym)
+            price_age = (now_utc - t).total_seconds() if t else None
         if plan_entry and live is None and sym in prices and price_times is not None and typ == "market":
-            warns.append("the %s price in trader/prices.json is older than %d minutes: not used"
-                         % (sym, FRESH_MINUTES))
+            warns.append("the %s price in trader/prices.json %s: not used" % (sym, _age_words(price_age)))
         q = _f(qty)
         if notional is not None and _f(notional):
             value = _f(notional)
@@ -524,8 +592,12 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             exiting = q <= -held + 1e-9
         kind = "exit" if exiting else "entry"
         if kind == "entry" and value is None and q:
-            later.append("price: no price for %s to size a %s-share order; add it to "
-                         "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
+            if plan_entry is None and typ == "market" and sym in prices and price_times is not None:
+                later.append("price: the %s price in trader/prices.json %s: no fresh price to size a "
+                             "market entry" % (sym, _age_words(price_age)))
+            else:
+                later.append("price: no price for %s to size a %s-share order; add it to "
+                             "trader/prices.json (trader-alerts: alerts.py quote %s --write)" % (sym, qty, sym))
 
         # blocked list and size
         if sym in blocked:
@@ -689,11 +761,13 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
             "stop": stop, "target": target, "risk_per_share": risk_ps, "max_loss": max_loss,
             "reward_risk": rr, "fingerprint": fingerprint(o), "verdict": verdict,
             "reasons": reasons, "warnings": warns, "info": info,
+            "valid_until": (entry_until if kind == "entry" else fresh_until).strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
 
     return {
         "date": today,
         "now_new_york": now_et.strftime("%Y-%m-%d %H:%M"),
+        "checked_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "paper": bool(c.get("paper", True)),
         "results": results,
         "pass": sum(1 for r in results if r["verdict"] == "PASS"),
@@ -701,6 +775,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         "warnings": top_warn,
         "cash_after": round(acct["cash"], 2),
         "today": {"orders_placed": count_today, "entries_placed": len(entries_today),
+                  "unresolved_approvals": len(pending),
                   "loss_at_risk": round(loss_today, 2), "day_trades_5d": pdt_n if c.get("pdt_guard") else None},
     }
 
@@ -787,6 +862,8 @@ def main(argv=None):
         orders = doc.get("orders", doc) if isinstance(doc, dict) else doc
         if not isinstance(orders, list) or not orders:
             raise RiskError("no orders in %s" % a.orders)
+        if not all(isinstance(o, dict) for o in orders):
+            raise RiskError("every order in %s must be a JSON object" % a.orders)
         cfg = read_json(a.config, "config", required=False) or {}
         portfolio = read_json(a.portfolio, "portfolio", required=False)
         pdoc = read_json(a.prices, "prices", required=False) or {}
@@ -800,8 +877,6 @@ def main(argv=None):
             if d:
                 os.makedirs(d, exist_ok=True)
             rec = dict(res)
-            rec["checked_at"] = datetime.datetime.now(datetime.timezone.utc).replace(
-                microsecond=0, tzinfo=None).strftime("%Y-%m-%dT%H:%M:%SZ")
             rec["orders_file"] = a.orders
             tmp = a.out + ".tmp"
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -810,6 +885,10 @@ def main(argv=None):
             os.replace(tmp, a.out)
     except RiskError as e:
         print("check.py: %s" % e, file=sys.stderr)
+        return 1
+    except (ValueError, TypeError, KeyError, OSError, ZeroDivisionError) as e:
+        print("check.py: unexpected %s: %s; the input files may be malformed" % (type(e).__name__, e),
+              file=sys.stderr)
         return 1
     print(json.dumps(res, indent=2) if a.json else report(res))
     return 1 if res["block"] else 0
