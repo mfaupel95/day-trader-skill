@@ -91,9 +91,9 @@ DEFAULTS = {
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
     "pdt_guard": False, "market": "us", "commission_per_trade": 0, "account_type": None,
 }
-TFSA_WARNING = ("TFSA: do not day trade inside a TFSA. The CRA can treat frequent trading there as carrying "
-                "on a business, and tax the gains as business income, not tax-free. Use a margin or cash "
-                "account for day trades. Not tax advice: ask a tax professional.")
+TFSA_WARNING = ("TFSA: frequent or business-like trading may be treated by the CRA as carrying on a business "
+                "and could be taxable as business income; treatment depends on the facts. Check current CRA guidance or ask a Canadian tax "
+                "professional before trading in a TFSA.")
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
                  "order_class", "take_profit_limit_price", "stop_loss_stop_price",
@@ -579,8 +579,8 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
         if acct_type == "tfsa":
             top_warn.append(TFSA_WARNING)
         elif not acct_type:
-            top_warn.append("TFSA: if this account is a TFSA, do not day trade in it (CRA business-income "
-                            "risk). Set \"account_type\" in the config to say which account it is.")
+            top_warn.append("TFSA: if this account is a TFSA, frequent or business-like trading may have "
+                            "tax consequences. Set \"account_type\" in the config to say which account it is.")
         if c.get("pdt_guard"):
             top_warn.append("pdt: Canada has no pattern-day-trader rule; \"pdt_guard\" is on in your config, "
                             "so day trades are still counted")

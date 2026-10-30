@@ -532,7 +532,7 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
     if next_open:
         out["median_fill"] = round(pct(sorted(fills), 0.5), 2)
     if include_results:
-        out["replay_results"] = list(enumerate(zip(outcomes, closes, Rs), 1))
+        out["replay_results"] = list(enumerate(zip(outcomes, closes, fills, Rs), 1))
     return out
 
 
@@ -607,10 +607,11 @@ def history_replay(sessions, rule, last, side="buy", fill="close"):
             if (b["h"] >= t) if long else (b["l"] <= t):
                 oc = "target"
                 break
-        x = t if oc == "target" else s if oc == "stop" else D[last]["c"]
+        cl = D[last]["c"]
+        x = t if oc == "target" else s if oc == "stop" else cl
         R = ((x - f) if long else (f - x)) / risk
         trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "fill": f, "stop": s,
-                       "target": t, "outcome": oc or "close", "R": round(R, 2)})
+                       "target": t, "outcome": oc or "close", "close": cl, "exit_price": x, "R": round(R, 2)})
     won = sum(1 for x in trades if x["outcome"] == "target")
     lost = sum(1 for x in trades if x["outcome"] == "stop")
     ci = wilson(won, won + lost)
@@ -1074,8 +1075,8 @@ def _write(path, doc):
 
 
 def _write_csv(path, doc, replay_results):
-    fields = ("record_type", "replay", "symbol", "side", "plan_date", "date", "time", "entry", "stop", "target",
-              "outcome", "close", "exit_price", "R")
+    fields = ("record_type", "replay", "symbol", "side", "plan_date", "date", "time", "entry", "fill", "stop",
+              "target", "outcome", "close", "exit_price", "R")
     directory = os.path.dirname(path)
     try:
         if directory:
@@ -1084,10 +1085,10 @@ def _write_csv(path, doc, replay_results):
             writer = csv.DictWriter(fh, fieldnames=fields)
             writer.writeheader()
             plan = doc["plan"]
-            for replay, (outcome, close, result) in replay_results or []:
+            for replay, (outcome, close, fill, result) in replay_results or []:
                 exit_price = plan["target"] if outcome == "target" else plan["stop"] if outcome == "stop" else close
                 writer.writerow({"record_type": "monte_carlo", "replay": replay, "symbol": plan["symbol"],
-                                 "side": plan["side"], "plan_date": plan["date"], "entry": plan["entry"],
+                                 "side": plan["side"], "plan_date": plan["date"], "entry": plan["entry"], "fill": fill,
                                  "stop": plan["stop"], "target": plan["target"], "outcome": outcome,
                                  "close": close, "exit_price": exit_price, "R": result})
             for item in doc["history"]["trades"]:
