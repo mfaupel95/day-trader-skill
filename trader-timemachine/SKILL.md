@@ -141,6 +141,14 @@ used.
   number. It says nothing about whether drawing bars this way is a fair
   picture of today.
 
+## Canada (TSX and TSXV)
+
+A Canadian plan from trader-exit carries `"market": "ca"` (or set it in `trader/config.json`, or
+pass `--market ca`). The replay is the same: the stock's own 60 days of 5-minute bars from Yahoo
+(`RY.TO`, `SHOP.TO`), 9:30 to 4:00 PM ET. Only the early close changes: the TSX closes at 1:00 PM
+on Christmas Eve 2026 and trades a full day after U.S. Thanksgiving. TSX holidays need no list,
+because a closed day has no bars.
+
 ## Steps
 
 1. Make sure `trader/plan.json` is today's plan from `/trader-exit`. If there
