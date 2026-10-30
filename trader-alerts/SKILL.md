@@ -117,6 +117,13 @@ files and ignores the computer's own zone. For a date in any other year
 `clock` and `check` both print "Holiday list covers 2026 and 2027 only: check
 nyse.com for this date" and carry on as if it were a normal weekday.
 
+## Canada (TSX and TSXV)
+
+With `"market": "ca"` in `trader/config.json` (or `--market ca`): `clock` is the TSX clock (TMX's
+2026 holidays; the U.S.-only holidays are TSX trading days; 1:00 PM close on Christmas Eve; 2027
+not published yet), the opening bell is the TSX's, prices print as C$ and quotes come from Yahoo
+(`RY.TO`, `AUMB.V`). Stooq is wired for US tickers (`.us`) and is refused for a Canadian one.
+
 ## Steps
 
 1. Right after trader-exit writes the plan, run `add --from-plan`. Confirm
