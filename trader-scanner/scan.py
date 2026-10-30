@@ -77,6 +77,7 @@ Exit code 0 when the scan found something, 1 when it did not or could not run.
 
 import argparse
 import datetime
+import email.utils
 import gzip
 import json
 import os
@@ -247,14 +248,24 @@ def http_get(url, timeout=20):
 
 
 def retry_after(headers):
-    """Seconds from a Retry-After header (digits only; an HTTP date is ignored), capped."""
+    """Seconds from Retry-After delta-seconds or HTTP-date, capped to a short wait."""
     try:
         v = headers.get("Retry-After") if headers is not None else None
     except Exception:
         v = None
-    if v is None or not str(v).strip().isdigit():
+    if v is None:
         return None
-    return min(float(str(v).strip()), MAX_RETRY_AFTER)
+    value = str(v).strip()
+    if value.isdigit():
+        return min(float(value), MAX_RETRY_AFTER)
+    try:
+        retry_at = email.utils.parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+        delay = retry_at.timestamp() - time.time()
+        return min(max(0.0, delay), MAX_RETRY_AFTER)
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
 
 
 def yahoo_get(path):

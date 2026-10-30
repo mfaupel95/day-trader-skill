@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import urllib.error
 from contextlib import redirect_stdout, redirect_stderr
+from unittest.mock import patch
 
 from _load import load, FIX
 
@@ -252,8 +253,20 @@ class Network(unittest.TestCase):
         self.assertEqual(self.sleeps, [scan.MAX_RETRY_AFTER])
         self.sleeps[:] = []
         self.answers([429, 429, 200], headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})
-        scan.yahoo_get("/v7/finance/spark?symbols=TSLA&range=3mo&interval=1d")
-        self.assertEqual(self.sleeps, [scan.BACKOFF])        # an HTTP date: the plain backoff
+        now = datetime.datetime(2026, 10, 21, 7, 27, 53, tzinfo=datetime.timezone.utc).timestamp()
+        with patch.object(scan.time, "time", return_value=now):
+            scan.yahoo_get("/v7/finance/spark?symbols=TSLA&range=3mo&interval=1d")
+        self.assertEqual(self.sleeps, [7.0])                 # HTTP-date is parsed relative to the response clock
+        self.sleeps[:] = []
+        self.answers([429, 429, 200], headers={"Retry-After": "Wed, 21 Oct 2026 07:28:53 GMT"})
+        with patch.object(scan.time, "time", return_value=now):
+            scan.yahoo_get("/v7/finance/spark?symbols=TSLA&range=3mo&interval=1d")
+        self.assertEqual(self.sleeps, [scan.MAX_RETRY_AFTER])
+        self.sleeps[:] = []
+        self.answers([429, 429, 200], headers={"Retry-After": "Wed, 21 Oct 2026 07:27:00 GMT"})
+        with patch.object(scan.time, "time", return_value=now):
+            scan.yahoo_get("/v7/finance/spark?symbols=TSLA&range=3mo&interval=1d")
+        self.assertEqual(self.sleeps, [0.0])
         self.answers([429, 429, 429, 429])
         with self.assertRaises(scan.RateLimited):
             scan.yahoo_get("/v7/finance/spark?symbols=TSLA&range=3mo&interval=1d")
