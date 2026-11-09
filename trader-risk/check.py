@@ -79,6 +79,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -399,9 +400,11 @@ def fingerprint(order):
 
 
 def _f(x):
+    """A finite number, or None: NaN must not bypass limit comparisons."""
     try:
-        return float(x)
-    except (TypeError, ValueError):
+        value = float(x)
+        return value if math.isfinite(value) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
